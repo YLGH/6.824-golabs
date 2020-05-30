@@ -1,10 +1,14 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -24,7 +28,6 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
@@ -32,33 +35,111 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
+	for {
+		reply, rc := CallGetTask()
+		if !rc {
+			return
+		}
+		fmt.Printf("Worker received reply=%v\n", reply)
+		workerID := reply.WorkerID
+		if reply.TaskType == "Nan" {
+			continue
+		} else if reply.TaskType == "done" {
+			return
+		} else if reply.TaskType == "map" {
+			filename := reply.MapReply.File
+			fileID := reply.MapReply.FileID
+			numReduce := reply.MapReply.NumReduce
+			partitionToKVList := make(map[int][]KeyValue)
+			for partition := 0; partition < numReduce; partition++ {
+				partitionToKVList[partition] = make([]KeyValue, 0)
+			}
 
-	// uncomment to send the Example RPC to the master.
-	// CallExample()
+			file, err := os.Open(filename)
+			if err != nil {
+				log.Fatalf("cannot open %v", filename)
+			}
+			content, err := ioutil.ReadAll(file)
+			if err != nil {
+				log.Fatalf("cannot read %v", filename)
+			}
+			file.Close()
+			kva := mapf(filename, string(content))
 
+			for _, kv := range kva {
+				partition := ihash(kv.Key) % numReduce
+				partitionToKVList[partition] = append(partitionToKVList[partition], kv)
+			}
+
+			for partition, KVList := range partitionToKVList {
+				tmpFile, err := ioutil.TempFile(".", "")
+				if err != nil {
+					log.Fatalf("Could not create a tmp file for patition=%d", partition)
+				}
+				enc := json.NewEncoder(tmpFile)
+
+				for _, kv := range KVList {
+					enc.Encode(&kv)
+				}
+
+				fileName := fmt.Sprintf("mr-%d-%d", fileID, partition)
+				tmpFileName := tmpFile.Name()
+				err = os.Rename(tmpFileName, fileName)
+				if err != nil {
+					log.Printf("Could not rename tmpFile=%s to %s\n", tmpFileName, fileName)
+				}
+			}
+		} else if reply.TaskType == "reduce" {
+			reduceFiles := reply.ReduceReply.Files
+			partition := reply.ReduceReply.Partition
+			keysToInstances := make(map[string][]string)
+			for _, fileName := range reduceFiles {
+				file, err := os.Open(fileName)
+				if err != nil {
+					log.Fatalf("Could not open filename=%s", fileName)
+				}
+				dec := json.NewDecoder(file)
+				for {
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
+						break
+					}
+					keysToInstances[kv.Key] = append(keysToInstances[kv.Key], kv.Value)
+				}
+			}
+			tmpFile, err := ioutil.TempFile(".", "")
+			if err != nil {
+				log.Fatalf("Could not create a tmp file for reduce worker with partition=%d", partition)
+			}
+			for key, valueList := range keysToInstances {
+				reduceValue := reducef(key, valueList)
+				tmpFile.Write([]byte(fmt.Sprintf("%s %s\n", key, reduceValue)))
+			}
+
+			fileName := fmt.Sprintf("mr-out-%d", partition)
+			tmpFileName := tmpFile.Name()
+			err = os.Rename(tmpFileName, fileName)
+			if err != nil {
+				log.Printf("Could not rename tmpFile=%s to %s\n", tmpFileName, fileName)
+			}
+		}
+		CallWorkerFinished(workerID)
+	}
 }
 
-//
-// example function to show how to make an RPC call to the master.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func CallGetTask() (GetTaskReply, bool) {
+	args := GetTaskArgs{}
+	reply := GetTaskReply{}
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+	rc := call("Master.GetTask", &args, &reply)
+	return reply, rc
+}
 
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	call("Master.Example", &args, &reply)
-
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+func CallWorkerFinished(workerID int) (TaskFinishedReply, bool) {
+	args := TaskFinishedArgs{WorkerID: workerID}
+	reply := TaskFinishedReply{}
+	rc := call("Master.WorkerFinished", &args, &reply)
+	return reply, rc
 }
 
 //
